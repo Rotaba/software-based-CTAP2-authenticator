@@ -1,0 +1,267 @@
+import collections
+import os
+import select
+import sys
+import time
+
+import u2fcrypto
+
+
+KGEN_KEY = None
+HMAC_KEY = None
+INCR_CNT = None
+V2F_DIR = None
+
+U2F_REGISTER        = 0x01
+U2F_AUTHENTICATE    = 0x02
+U2F_VERSION         = 0x03
+
+SW_NO_ERROR                 = 0x9000
+SW_CONDITIONS_NOT_SATISFIED = 0x6985
+SW_WRONG_DATA               = 0x6984
+SW_INS_NOT_SUPPORTED        = 0x6d00
+
+ApduCmd = collections.namedtuple('ApduCmd', 'cla ins p1 p2 len data')
+
+
+def initialize(device_master_secret_key, update_counter, v2f_dir):
+    global KGEN_KEY
+    global HMAC_KEY
+    global INCR_CNT
+    global V2F_DIR
+    assert len(device_master_secret_key) == 64
+    KGEN_KEY = device_master_secret_key[:32]
+    HMAC_KEY = device_master_secret_key[32:]
+    INCR_CNT = update_counter
+    V2F_DIR = v2f_dir
+
+
+def process_u2fraw_request(raw_request):
+    print('raw_request: ', raw_request)
+    try:
+        apducmd = decode_apdu_command(raw_request)
+
+        if apducmd.ins == U2F_VERSION:
+            assert len(apducmd.data) == 0
+            sw, resp = generate_get_version_response_message()
+        elif apducmd.ins == U2F_REGISTER:
+            assert len(apducmd.data) == 64
+            application_parameter = apducmd.data[32:]
+            challenge_parameter = apducmd.data[:32]
+            sw, resp = generate_registration_response_message(application_parameter, challenge_parameter) #create response to reg
+        elif apducmd.ins == U2F_AUTHENTICATE and apducmd.p1 == 0x07:
+            assert len(apducmd.data) >= 65
+            assert len(apducmd.data[65:]) == apducmd.data[64]
+            sw, resp = generate_key_handle_checking_response(apducmd.data[32:64], apducmd.data[65:])
+        elif apducmd.ins == U2F_AUTHENTICATE and apducmd.p1 == 0x03:
+            assert len(apducmd.data) >= 65
+            assert len(apducmd.data[65:]) == apducmd.data[64]
+            sw, resp = generate_authentication_response_message(apducmd.data[32:64], apducmd.data[0:32], apducmd.data[65:])
+        else:
+            sw, resp = SW_INS_NOT_SUPPORTED, b''
+
+    except AssertionError:
+        sw, resp = SW_WRONG_DATA, b''
+    print('***resp + sw.to_bytes(2, \'big\')***: ', resp + sw.to_bytes(2, 'big') )
+    return resp + sw.to_bytes(2, 'big')
+
+
+def _is_good_key_handle(application_parameter, key_handle):
+    try:
+        assert len(key_handle) is 64
+        kg_nonce = key_handle[:32]
+        checksum = key_handle[32:]
+        assert u2fcrypto.hmacsha256(HMAC_KEY, application_parameter + kg_nonce) == checksum
+        return True
+    except AssertionError:
+        return False
+
+
+def _get_key_pair(application_parameter, key_handle):
+    kg_nonce = key_handle[:32]
+    privatekey, publickey = u2fcrypto.generate_p256ecdsa_keypair(
+            application_parameter + kg_nonce)
+    return privatekey, publickey
+
+
+def _generate_new_key_handle(application_parameter):
+    kg_nonce = os.urandom(32)
+    checksum = u2fcrypto.hmacsha256(HMAC_KEY, application_parameter + kg_nonce)
+    key_handle = kg_nonce + checksum
+    return key_handle
+
+
+def generate_get_version_response_message():
+    return SW_NO_ERROR, b'U2F_V2'
+
+
+def generate_registration_response_message(application_parameter, challenge_parameter):
+    print('''
+%s %s
+
+Got an event from some relying party!
+
+A website is asking you to register the authenticator,
+and it is claiming itself to be APPID with SHA256(APPID) =
+%s''' % (sys.argv[0], V2F_DIR, application_parameter.hex()))
+    if not user_says_yes('Enter yes to register'):
+        return SW_CONDITIONS_NOT_SATISFIED, b''
+
+    print()
+    print('IF (WebAuthn): Please return to the web page in 3 seconds to avoid timeout!')
+    print()
+    time.sleep(3)
+
+    kh = _generate_new_key_handle(application_parameter)
+    sk, pk = _get_key_pair(application_parameter, kh)
+    data_to_sign = b''.join([
+        b'\x00',
+        application_parameter,
+        challenge_parameter,
+        kh,
+        pk,
+    ])
+    signature = u2fcrypto.generate_sha256_p256ecdsa_signature(sk, data_to_sign)
+    #print('***data_to_sign*** :=', data_to_sign)
+    
+    # ~ print(b'\x05')
+    # ~ print('***public key*** :=', pk.hex())
+    # ~ print(b'\x40')
+    # ~ print('***key handle?*** :=', kh)
+    # ~ print('***sig*** :=', signature)
+    # ~ print('***x5c*** :=', u2fcrypto.x509encode_p256ecdsa_publickey(pk))
+    result = b''.join([
+        b'\x05', # was b'\x05', in u2f-fido
+        pk,
+        b'\x40',
+        kh, #key handle?
+        u2fcrypto.x509encode_p256ecdsa_publickey(pk),
+        signature,
+    ])
+    
+    # ~ n = int('01000001', 2)
+    # ~ flags = bytes([n])
+    # ~ n = int('00000000000000000000000000000000', 2)
+    # ~ counter = bytes([n])
+    # ~ n = int('0000000000000000', 2)
+    # ~ aaguid = bytes([n])
+    
+    from binascii import a2b_hex
+    
+    public_key = a2b_hex('04b174bc49c7ca254b70d2e5c207cee9cf174820ebd77ea3c65508c26da51b657c1cc6b952f8621697936482da0a6d3d3826a59095daf6cd7c03e2e60385d2f6d9')  # noqa
+    key_handle = a2b_hex('2a552dfdb7477ed65fd84133f86196010b2215b57da75d315b7b9e8fe2e3925a6019551bab61d16591659cbaf00b4950f7abfe6660e2e006f76868b772d70c25')  # noqa
+    certificate = a2b_hex('3082013c3081e4a003020102020a47901280001155957352300a06082a8648ce3d0403023017311530130603550403130c476e756262792050696c6f74301e170d3132303831343138323933325a170d3133303831343138323933325a3031312f302d0603550403132650696c6f74476e756262792d302e342e312d34373930313238303030313135353935373335323059301306072a8648ce3d020106082a8648ce3d030107034200048d617e65c9508e64bcc5673ac82a6799da3c1446682c258c463fffdf58dfd2fa3e6c378b53d795c4a4dffb4199edd7862f23abaf0203b4b8911ba0569994e101300a06082a8648ce3d0403020347003044022060cdb6061e9c22262d1aac1d96d8c70829b2366531dda268832cb836bcd30dfa0220631b1459f09e6330055722c8d89b7f48883b9089b88d60d1d9795902b30410df')  # noqa
+    signature = a2b_hex('304502201471899bcc3987e62e8202c9b39c33c19033f7340352dba80fcab017db9230e402210082677d673d891933ade6f617e5dbde2e247e70423fd5ad7804a6d3d3961ef871')  # noqa
+    
+    # ~ from fido2.ctap2 import AuthenticatorData
+    
+    # ~ auth_data = (a2b_hex(b'1194228DA8FDBDEEFD261BD7B6595CFD70A50D70C6407BCF013DE96D4EFB17DE41000000000000000000000000000000000000000000403EBD89BF77EC509755EE9C2635EFAAAC7B2B9C5CEF1736C3717DA48534C8C6B654D7FF945F50B5CC4E78055BDD396B64F78DA2C5F96200CCD415CD08FE420038A5010203262001215820E87625896EE4E46DC032766E8087962F36DF9DFE8B567F3763015B1990A60E1422582027DE612D66418BDA1950581EBC5C8C1DAD710CB14C22F8C97045F4612FB20C91'))  # noqa
+    # ~ client_param = a2b_hex(b'687134968222EC17202E42505F8ED2B16AE22F16BB05B88C25DB9E602645F141')  # noqa
+    # ~ statement = {
+            # ~ 'sig': a2b_hex(b'30450220324779C68F3380288A1197B6095F7A6EB9B1B1C127F66AE12A99FE8532EC23B9022100E39516AC4D61EE64044D50B415A6A4D4D84BA6D895CB5AB7A1AA7D081DE341FA'),  # noqa
+            # ~ 'x5c': [a2b_hex(b'3082024A30820132A0030201020204046C8822300D06092A864886F70D01010B0500302E312C302A0603550403132359756269636F2055324620526F6F742043412053657269616C203435373230303633313020170D3134303830313030303030305A180F32303530303930343030303030305A302C312A302806035504030C2159756269636F205532462045452053657269616C203234393138323332343737303059301306072A8648CE3D020106082A8648CE3D030107034200043CCAB92CCB97287EE8E639437E21FCD6B6F165B2D5A3F3DB131D31C16B742BB476D8D1E99080EB546C9BBDF556E6210FD42785899E78CC589EBE310F6CDB9FF4A33B3039302206092B0601040182C40A020415312E332E362E312E342E312E34313438322E312E323013060B2B0601040182E51C020101040403020430300D06092A864886F70D01010B050003820101009F9B052248BC4CF42CC5991FCAABAC9B651BBE5BDCDC8EF0AD2C1C1FFB36D18715D42E78B249224F92C7E6E7A05C49F0E7E4C881BF2E94F45E4A21833D7456851D0F6C145A29540C874F3092C934B43D222B8962C0F410CEF1DB75892AF116B44A96F5D35ADEA3822FC7146F6004385BCB69B65C99E7EB6919786703C0D8CD41E8F75CCA44AA8AB725AD8E799FF3A8696A6F1B2656E631B1E40183C08FDA53FA4A8F85A05693944AE179A1339D002D15CABD810090EC722EF5DEF9965A371D415D624B68A2707CAD97BCDD1785AF97E258F33DF56A031AA0356D8E8D5EBCADC74E071636C6B110ACE5CC9B90DFEACAE640FF1BB0F1FE5DB4EFF7A95F060733F5')]  # noqa
+        # ~ }
+    # ~ fmt = {
+            # ~ 'fmt': a2b_hex(b'fido-u2f')}
+    
+    # ~ from binascii import hexlify
+    
+    # ~ fmt2 = 'fido-u2f'
+    # ~ fmt3 = a2b_hex(b'6669646f2d753266')
+    # ~ result2 = b''.join([
+        # ~ auth_data,
+        # ~ fmt3,
+        # ~ signature,
+        # ~ certificate,
+    # ~ ])
+    
+    # ~ RegistrationData = (a2b_hex(b'0504b174bc49c7ca254b70d2e5c207cee9cf174820ebd77ea3c65508c26da51b657c1cc6b952f8621697936482da0a6d3d3826a59095daf6cd7c03e2e60385d2f6d9402a552dfdb7477ed65fd84133f86196010b2215b57da75d315b7b9e8fe2e3925a6019551bab61d16591659cbaf00b4950f7abfe6660e2e006f76868b772d70c253082013c3081e4a003020102020a47901280001155957352300a06082a8648ce3d0403023017311530130603550403130c476e756262792050696c6f74301e170d3132303831343138323933325a170d3133303831343138323933325a3031312f302d0603550403132650696c6f74476e756262792d302e342e312d34373930313238303030313135353935373335323059301306072a8648ce3d020106082a8648ce3d030107034200048d617e65c9508e64bcc5673ac82a6799da3c1446682c258c463fffdf58dfd2fa3e6c378b53d795c4a4dffb4199edd7862f23abaf0203b4b8911ba0569994e101300a06082a8648ce3d0403020347003044022060cdb6061e9c22262d1aac1d96d8c70829b2366531dda268832cb836bcd30dfa0220631b1459f09e6330055722c8d89b7f48883b9089b88d60d1d9795902b30410df304502201471899bcc3987e62e8202c9b39c33c19033f7340352dba80fcab017db9230e402210082677d673d891933ade6f617e5dbde2e247e70423fd5ad7804a6d3d3961ef871'))  # noqa
+    
+    # ~ result4 = b''.join([
+        # ~ RegistrationData
+    # ~ ])
+    
+    result3 = b''.join([
+        b'\x05', # was b'\x05', in u2f-fido
+        public_key,
+        b'\x40',
+        key_handle, #key handle?
+        certificate,
+        signature,
+    ])
+    #result3 = b'\x00a301667061636b656402589ac289c5ca9b0460f9346ab4e42d842743404d31f4846825a6d065be597a87051d410000000bf8a011f38c0a4d15800617111f9edc7d00108959cead5b5c48164e8abcd6d9435c6fa363616c6765455332353661785820f7c4f4a6f1d79538dfa4c9ac50848df708bc1c99f5e60e51b42a521b35d3b69a61795820de7b7d6ca564e70ea321a4d5d96ea00ef0e2db89dd61d4894c15ac585bd2368403a363616c67266373696758473045022013f73c5d9d530e8cc15cc9bd96ad586d393664e462d5f0561235e6350f2b728902210090357ff910ccb56ac5b596511948581c8fddb4a2b79959948078b09f4bdc622963783563815901973082019330820138a003020102020900859b726cb24b4c29300a06082a8648ce3d0403023047310b300906035504061302555331143012060355040a0c0b59756269636f205465737431223020060355040b0c1941757468656e74696361746f72204174746573746174696f6e301e170d3136313230343131353530305a170d3236313230323131353530305a3047310b300906035504061302555331143012060355040a0c0b59756269636f205465737431223020060355040b0c1941757468656e74696361746f72204174746573746174696f6e3059301306072a8648ce3d020106082a8648ce3d03010703420004ad11eb0e8852e53ad5dfed86b41e6134a18ec4e1af8f221a3c7d6e636c80ea13c3d504ff2e76211bb44525b196c44cb4849979cf6f896ecd2bb860de1bf4376ba30d300b30090603551d1304023000300a06082a8648ce3d0403020349003046022100e9a39f1b03197525f7373e10ce77e78021731b94d0c03f3fda1fd22db3d030e7022100c4faec3445a820cf43129cdb00aabefd9ae2d874f9c5d343cb2f113da23723f3'
+    # ~ print ('result1: ', result)
+    # ~ print ('result3: ', result3)
+    
+    #import js2py
+    result_from_key = b'\xa301667061636b65640258c4a379a6f6eeafb9a55e378c118034e2751e682fab9f2d30ab13d2125586ce19474100000062f8a011f38c0a4d15800617111f9edc7d0040818e7cd0871283afdb9f776236af0a0418eb163c606e5898da0214a9e4f45d854fccb7c59c9ca72e0b8ebc67bebabde19aaba01e8dd017336bb0715a0c17a795a5010203262001215820dd06299e7f8b35aafba2469d909593b62f9d528d0061c2898db5a056111736d3225820c38c5b4b6cdeb1661a7d0f5b3f589e52b2988788e255a780b9a449d1863d822103a363616c67266373696758473045022100b077ef7ebb634b21438108eaf277c3eb7ae8906806eb94516e4e2a04f55c39c702206c6c43a0153ec498ea51cdd69a68c927e378da0f6124d68035750785405ca6f263783563815902c2308202be308201a6a00302010202047486fdc2300d06092a864886f70d01010b0500302e312c302a0603550403132359756269636f2055324620526f6f742043412053657269616c203435373230303633313020170d3134303830313030303030305a180f32303530303930343030303030305a306f310b300906035504061302534531123010060355040a0c0959756269636f20414231223020060355040b0c1941757468656e74696361746f72204174746573746174696f6e3128302606035504030c1f59756269636f205532462045452053657269616c20313935353030333834323059301306072a8648ce3d020106082a8648ce3d03010703420004955df3adf7247d3175effd9cc4f31a4e878ebae18109566150fb388b2e5f6527bf57409aa581a50d0ac52f18445c0a13548a1353c8a4e59a704e523bc04debeda36c306a302206092b0601040182c40a020415312e332e362e312e342e312e34313438322e312e313013060b2b0601040182e51c0201010404030205203021060b2b0601040182e51c01010404120410f8a011f38c0a4d15800617111f9edc7d300c0603551d130101ff04023000300d06092a864886f70d01010b05000382010100315c4880e69a527e386689bd69fd0aa86f49eb9e4e854541556faad00b3a008a1ddc01f96c76f668361a91e232c810a79c63074c9b6e7a46eb1db5d85c44489f868a7643d22a5c862ec03f03e5848be3807d7acd55f8e1ae1ee213ac73ab4b20e3fbd5268cb07b8780271d1f4be0e5ddac734d3a5897bd4d73ba7f357ea208c99d8a4d2902e6097a005c4dc904dc0a18120e0af7d00cfc969a2886e5b1b161f3edcbc677a678d7fb53039ccda186be34ba53319523439d7fd94a70f230621b93c4ce4268d3174d943bc6ae3fc937c2de43d6b44e21153df850925f9590622ebc46e0eb18c641f0fe7e6f2a09a9b2907719f62e6135a19032a213c098b7283cee'
+    
+    statement = {
+            'alg': -7,
+            'sig': a2b_hex(b'304502200D15DAF337D727AB4719B4027114A2AC43CD565D394CED62C3D9D1D90825F0B3022100989615E7394C87F4AD91F8FDAE86F7A3326DF332B3633DB088AAC76BFFB9A46B'),  # noqa
+            'x5c': [a2b_hex(b'308202B73082019FA00302010202041D31330D300D06092A864886F70D01010B0500302A3128302606035504030C1F59756269636F2050726576696577204649444F204174746573746174696F6E301E170D3138303332383036333932345A170D3139303332383036333932345A306E310B300906035504061302534531123010060355040A0C0959756269636F20414231223020060355040B0C1941757468656E74696361746F72204174746573746174696F6E3127302506035504030C1E59756269636F205532462045452053657269616C203438393736333539373059301306072A8648CE3D020106082A8648CE3D030107034200047D71E8367CAFD0EA6CF0D61E4C6A416BA5BB6D8FAD52DB2389AD07969F0F463BFDDDDDC29D39D3199163EE49575A3336C04B3309D607F6160C81E023373E0197A36C306A302206092B0601040182C40A020415312E332E362E312E342E312E34313438322E312E323013060B2B0601040182E51C0201010404030204303021060B2B0601040182E51C01010404120410F8A011F38C0A4D15800617111F9EDC7D300C0603551D130101FF04023000300D06092A864886F70D01010B050003820101009B904CEADBE1F1985486FEAD02BAEAA77E5AB4E6E52B7E6A2666A4DC06E241578169193B63DADEC5B2B78605A128B2E03F7FE2A98EAEB4219F52220995F400CE15D630CF0598BA662D7162459F1AD1FC623067376D4E4091BE65AC1A33D8561B9996C0529EC1816D1710786384D5E8783AA1F7474CB99FE8F5A63A79FF454380361C299D67CB5CC7C79F0D8C09F8849B0500F6D625408C77CBBC26DDEE11CB581BEB7947137AD4F05AAF38BD98DA10042DDCAC277604A395A5B3EAA88A5C8BB27AB59C8127D59D6BBBA5F11506BF7B75FDA7561A0837C46F025FD54DCF1014FC8D17C859507AC57D4B1DEA99485DF0BA8F34D00103C3EEF2EF3BBFEC7A6613DE')]  # noqa
+        }
+    from fido2.ctap2 import AuthenticatorData    
+    auth_data = AuthenticatorData(a2b_hex(b'0021F5FC0B85CD22E60623BCD7D1CA48948909249B4776EB515154E57B66AE124100000003F8A011F38C0A4D15800617111F9EDC7D004060A386206A3AACECBDBB22D601853D955FDC5D11ADFBD1AA6A950D966B348C7663D40173714A9F987DF6461BEADFB9CD6419FFDFE4D4CF2EEC1AA605A4F59BDAA50102032620012158200EDB27580389494D74D2373B8F8C2E8B76FA135946D4F30D0E187E120B423349225820E03400D189E85A55DE9AB0F538ED60736EB750F5F0306A80060FE1B13010560D'))  # noqa
+    client_param = a2b_hex(b'985B6187D042FB1258892ED637CEC88617DDF5F6632351A545617AA2B75261BF')  # noqa
+    
+    result5 = b''.join([
+        statement,
+        auth_data,
+        client_param
+    ])
+    
+    return SW_NO_ERROR, result
+
+
+def generate_key_handle_checking_response(application_parameter, key_handle):
+    if _is_good_key_handle(application_parameter, key_handle):
+        return SW_CONDITIONS_NOT_SATISFIED, b''
+    else:
+        return SW_WRONG_DATA, b''
+
+
+def generate_authentication_response_message(application_parameter, challenge_parameter, key_handle):
+    if not _is_good_key_handle(application_parameter, key_handle):
+        return SW_WRONG_DATA, b''
+
+    print('''
+%s %s
+
+Got an event from some relying party!
+
+A website is asking you to login with the authenticator,
+and it is claiming itself to be APPID with SHA256(APPID) =
+%s''' % (sys.argv[0], V2F_DIR, application_parameter.hex()))
+    if not user_says_yes('Enter yes to login'):
+        return SW_CONDITIONS_NOT_SATISFIED, b''
+    print()
+
+    sk, pk = _get_key_pair(application_parameter, key_handle)
+    counter = INCR_CNT().to_bytes(4, 'big')
+    data_to_sign = b''.join([
+        application_parameter,
+        b'\x01',
+        counter,
+        challenge_parameter,
+    ])
+    signature = u2fcrypto.generate_sha256_p256ecdsa_signature(sk, data_to_sign)
+    result = b''.join([
+        b'\x01',
+        counter,
+        signature
+    ])
+    return SW_NO_ERROR, result
+
+
+def decode_apdu_command(x):
+    assert len(x) >= 7
+    cmd_data_len = (x[4]<<16)|(x[5]<<8)|x[6]
+    data_and_tail = x[7:]
+    assert len(data_and_tail) >= cmd_data_len
+    return ApduCmd(cla=x[0], ins=x[1], p1=x[2], p2=x[3], len=cmd_data_len, data=data_and_tail[:cmd_data_len])
+
+
+def user_says_yes(prompt, timeout=10):
+    print('\n' + prompt + ': ', end='', flush=True)
+    return ([] != select.select([sys.stdin], [], [], timeout)[0]) and sys.stdin.readline() == 'yes\n'
