@@ -7,7 +7,7 @@ https://github.com/Yubico/python-fido2
 ```bash
 pip3 install fido2 
 ```
-After you clone the repo, you'll have to tweak the permissions of some files before running v2f, which needs uhid and hidraw.  An easy way to do that is just making `/dev/uhid` and `/dev/hidraw*` device nodes universally read-writable - there's a simple .sh to help you - TAKE NOTE; I HIGHLY RECOMMEND RUNNING THIS ON A VM TO AVOID RUINING YOUR SYSTEM
+After you clone the repo, you'll have to tweak the permissions of some files before running v2f, which needs uhid and hidraw access.  An easy way to do that is just making `/dev/uhid` and `/dev/hidraw*` device nodes universally read-writable - there's a simple .sh to help you - TAKE NOTE; I HIGHLY RECOMMEND RUNNING THIS ON A VM TO AVOID SABOTAGING YOUR SYSTEM
 
 ```bash
 sudo bash hack-linux-for-v2f
@@ -23,17 +23,17 @@ Run v2f with a specified device information directory
 ```bash
 python3 v2f.py ~/.my-v2f-info-dir
 ```
-You can use the Yubieko testing lib to try-out the program, mainly credentails.py; to run a full CTAP cycle of attest-assert
+You can use the Yubieko testing lib to try-out the program, mainly credentials.py; to run a full CTAP cycle of attest-assert
 
 ```bash
 get_info.py.py
-credentails.py
+credentials.py
 multi_device.py 
 ```
 
-This implementation was build upon an already existing U2F (FIDO1) token app with an unerlaying UHID API as an interface.
+This implementation was build upon an already existing U2F (FIDO1) token app with an underlying UHID API as an interface.
 Because of this, some functions are deprecated while other were heavily altered to fit the new CTAP2 format.
-Nonetheless this implementation follows the same general structre;
+Nonetheless this implementation follows the same general structure;
 
 ```bash
 u2fhid.py
@@ -45,17 +45,16 @@ finally the u2fraw is in charge of the CTAP data-exchange -
 
 ```bash
 initialize - create key and cert and init constants
-process_u2fraw_request - get raw request; check first bytes for command and reroute accordingly to;
-generate_get_version_response_message
-generate_get_info_response_message
-generate_registration_response_message
-generate_authentication_response_message
+process_u2fraw_request - get raw request; check first bytes for command and reroute accordingly;
+    generate_get_version_response_message - answer with a static version response
+    generate_get_info_response_message - answer with a static info_data response
+    generate_registration_response_message - generate and form a CBOR attestation object
+    generate_authentication_response_message - generate and form a CBOR assertion object
+parsing the msg, generating a response and sending it back to the UHID through u2fhid.py
 all those have also a U2F versions which are left in the code for back compatability reasons - not tested yet
 ```
-On a get_info request we answer with a static info_data response 
-On gen_reg we parse the msg - generate and form a CBOR attestation object to be send back through the UHID
-On gen_auth we do the same for a CBOR auth object
-All throughout u2fraw I've used the same terms as specified in FIDO2-CTAP2 doc as part of the W3C Webauthn standard
+
+All throughout the u2fraw I've used the same terms as specified in FIDO2-CTAP2 doc as part of the W3C Webauthn standard
 https://www.w3.org/TR/webauthn
 https://fidoalliance.org/specs/fido-v2.0-ps-20170927/fido-client-to-authenticator-protocol-v2.0-ps-20170927.html
 
